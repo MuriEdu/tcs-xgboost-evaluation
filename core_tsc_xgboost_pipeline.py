@@ -26,6 +26,7 @@ from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 
 from tsc_models import BaseTimeSeriesClassifier, NullTimeSeriesClassifier
+from tsc_models import CanonicalIntervalForestClassifier
 
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,10 @@ def load_dataset(path: str, target_column: str = "inadimplent") -> pl.DataFrame:
     if extension in {".xls", ".xlsx"}:
         try:
             connection = duckdb.connect()
+            connection.install_extension("excel")
+            connection.load_extension("excel")
             arrow_table = connection.execute(
-                f"SELECT * FROM read_excel_auto('{path}')"
+                f"SELECT * FROM read_xlsx('{path}')"
             ).arrow()
             df = pl.from_arrow(arrow_table)
         except Exception as exc:
@@ -78,14 +81,19 @@ def normalize_target(series: pl.Series) -> pl.Series:
         "f": 0,
         "negative": 0,
     }
-    normalized = series.cast(pl.Utf8).str.to_lowercase().str.strip()
-    mapped = normalized.map_dict(mapping, default=None)
-    filled = mapped.fill_null(normalized)
-
-    try:
-        target = filled.cast(pl.Int64)
-    except Exception as exc:
-        raise ValueError("Target column could not be converted into binary values 0/1.") from exc
+    if series.dtype in {pl.Float32, pl.Float64}:
+        try:
+            target = series.cast(pl.Int64)
+        except Exception as exc:
+            raise ValueError("Target column could not be converted into binary values 0/1.") from exc
+    else:
+        normalized = series.cast(pl.Utf8).str.to_lowercase().str.strip_chars()
+        mapped = normalized.replace(mapping, default=None)
+        filled = mapped.fill_null(normalized)
+        try:
+            target = filled.cast(pl.Float64).cast(pl.Int64)
+        except Exception as exc:
+            raise ValueError("Target column could not be converted into binary values 0/1.") from exc
 
     if not target.is_in([0, 1]).all():
         raise ValueError("Target column could not be converted into binary values 0/1.")
@@ -245,12 +253,12 @@ def validate_pipeline(
     sample_index = np.arange(len(y_np), dtype=int)
 
     for fold_index, (train_idx, test_idx) in enumerate(splitter.split(sample_index, y_np), start=1):
-        X_static_train = X_static.take(train_idx)
-        X_static_test = X_static.take(test_idx)
-        X_temporal_train = X_temporal.take(train_idx)
-        X_temporal_test = X_temporal.take(test_idx)
-        y_train = y.take(train_idx)
-        y_test = y.take(test_idx)
+        X_static_train = X_static.gather(train_idx)
+        X_static_test = X_static.gather(test_idx)
+        X_temporal_train = X_temporal.gather(train_idx)
+        X_temporal_test = X_temporal.gather(test_idx)
+        y_train = y.gather(train_idx)
+        y_test = y.gather(test_idx)
 
         X_meta_train = build_meta_features(tsc_model, X_temporal_train, y_train)
         X_meta_test = build_meta_features(tsc_model, X_temporal_test)
@@ -295,10 +303,10 @@ def validate_pipeline(
 
 def main() -> None:
     dataset_path = "dataset_aumentado.xlsx"
-    df = load_dataset(dataset_path)
+    df = load_dataset(dataset_path, target_column="default payment next month")
 
-    X_static, X_temporal, y = split_static_temporal_features(df, target_column="inadimplent")
-    tsc_model = NullTimeSeriesClassifier()
+    X_static, X_temporal, y = split_static_temporal_features(df, target_column="default payment next month")
+    tsc_model = CanonicalIntervalForestClassifier(n_estimators=200, random_state=42)
 
     logger.info("Starting stratified 10-fold validation with the stacked pipeline.")
     results = validate_pipeline(X_static, X_temporal, y, tsc_model, n_splits=10)
