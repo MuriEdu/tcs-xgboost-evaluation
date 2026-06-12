@@ -323,6 +323,7 @@ def main() -> None:
             "Null": NullTimeSeriesClassifier(),
             "CIF": CanonicalIntervalForestClassifier(n_estimators=200, random_state=42),
             "ROCKET": RocketTimeSeriesClassifier(num_kernels=10_000, random_state=42),
+            "Shapelets": ShapeletTimeSeriesClassifier(num_shapelets=100, random_state=42),
             "LSTM": LSTMTimeSeriesClassifier(hidden_size=32, epochs=30, random_state=42),
         }
         all_results: Dict[str, Dict] = {}

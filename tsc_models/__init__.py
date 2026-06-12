@@ -5,6 +5,7 @@ from .canonical_interval_forest import CanonicalIntervalForestClassifier
 from .lstm_classifier import LSTMTimeSeriesClassifier
 from .null_classifier import NullTimeSeriesClassifier
 from .rocket_classifier import RocketTimeSeriesClassifier
+from .shapelet_classifier import ShapeletTimeSeriesClassifier
 
 __all__ = [
     "BaseTimeSeriesClassifier",
@@ -12,4 +13,5 @@ __all__ = [
     "LSTMTimeSeriesClassifier",
     "NullTimeSeriesClassifier",
     "RocketTimeSeriesClassifier",
+    "ShapeletTimeSeriesClassifier",
 ]
