@@ -112,32 +112,6 @@ def normalize_target(series: pl.Series) -> pl.Series:
 
 
 def detect_temporal_columns(columns: List[str]) -> List[str]:
-    mapping = {
-        "inadimplent": 1,
-        "default": 1,
-        "yes": 1,
-        "y": 1,
-        "true": 1,
-        "t": 1,
-        "positive": 1,
-        "non": 0,
-        "no": 0,
-        "n": 0,
-        "false": 0,
-        "f": 0,
-        "negative": 0,
-    }
-    normalized = series.astype(str).str.strip().str.lower().replace(mapping)
-    if normalized.isin([0, 1]).all():
-        return normalized.astype(int)
-
-    try:
-        return series.astype(int)
-    except ValueError as exc:
-        raise ValueError("Target column could not be converted into binary values 0/1.") from exc
-
-
-def detect_temporal_columns(columns: List[str]) -> List[str]:
     time_pattern = re.compile(
         r"(?:^|_|\.|\-)(?:t(?:ime)?|ts|hist|month|m|wk|week|day|period|lag|seq|step)[_\-.]?\d+$",
         flags=re.IGNORECASE,
