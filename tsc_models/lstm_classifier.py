@@ -47,6 +47,7 @@ class LSTMTimeSeriesClassifier(BaseTimeSeriesClassifier):
         batch_size: int = 64,
         learning_rate: float = 1e-3,
         device: Optional[str] = None,
+        random_state: Optional[int] = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -55,6 +56,7 @@ class LSTMTimeSeriesClassifier(BaseTimeSeriesClassifier):
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.random_state = random_state
         self._encoder: Optional[_LSTMEncoder] = None
 
     def _to_tensor(self, X: pl.DataFrame) -> torch.Tensor:
@@ -63,6 +65,10 @@ class LSTMTimeSeriesClassifier(BaseTimeSeriesClassifier):
         return torch.from_numpy(arr).unsqueeze(-1).to(self.device)
 
     def fit(self, X: pl.DataFrame, y: Optional[pl.Series] = None) -> "LSTMTimeSeriesClassifier":
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
         seq_len = X.width
         encoder = _LSTMEncoder(
             input_size=1,
