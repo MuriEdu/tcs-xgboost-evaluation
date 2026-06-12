@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 
 from tsc_models import BaseTimeSeriesClassifier, NullTimeSeriesClassifier
-from tsc_models import CanonicalIntervalForestClassifier
+from tsc_models import CanonicalIntervalForestClassifier, LSTMTimeSeriesClassifier, RocketTimeSeriesClassifier
 
 
 logger = logging.getLogger(__name__)
@@ -311,31 +311,58 @@ def validate_pipeline(
     }
 
 
+def _print_comparison_table(all_results: Dict[str, Dict]) -> None:
+    metrics = ["auc_roc", "f1_score", "g_mean"]
+    header = f"{'Model':<10}  {'AUC-ROC':>10}  {'F1':>10}  {'G-Mean':>10}"
+    separator = "-" * len(header)
+    print("\n" + separator)
+    print(header)
+    print(separator)
+    for model_name, results in all_results.items():
+        agg = results["aggregate"]
+        print(
+            f"{model_name:<10}  "
+            f"{agg['auc_roc']['mean']:>8.4f}±{agg['auc_roc']['std']:.4f}  "
+            f"{agg['f1_score']['mean']:>8.4f}±{agg['f1_score']['std']:.4f}  "
+            f"{agg['g_mean']['mean']:>8.4f}±{agg['g_mean']['std']:.4f}"
+        )
+    print(separator + "\n")
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TSC + XGBoost forecasting pipeline.")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run all TSC models and print a comparison table.",
+    )
+    args = parser.parse_args()
+
     dataset_path = "dataset_aumentado.xlsx"
     df = load_dataset(dataset_path, target_column="default payment next month")
-
     X_static, X_temporal, y = split_static_temporal_features(df, target_column="default payment next month")
-    tsc_model = CanonicalIntervalForestClassifier(n_estimators=200, random_state=42)
 
-    logger.info("Starting stratified 10-fold validation with the stacked pipeline.")
-    results = validate_pipeline(X_static, X_temporal, y, tsc_model, n_splits=10)
-
-    logger.info("Aggregate validation results:")
-    for metric, stats in results["aggregate"].items():
-        logger.info("  %s: mean=%.4f, std=%.4f", metric, stats["mean"], stats["std"])
-
-    # Baseline comparison mock:
-    # - A production-grade review should compare the stacked pipeline metrics above
-    #   against one or more baselines, such as:
-    #     * XGBoost trained on static-only features
-    #     * XGBoost trained on static + raw temporal features without TSC meta-features
-    #     * XGBoost trained on temporal meta-features from a real TSC model
-    # - To compare, define a second validation call and log both `aggregate` results side-by-side.
-    # Example structure:
-    # baseline_results = validate_pipeline(X_static, X_temporal, y, NullTimeSeriesClassifier(), n_splits=10)
-    # stacked_results = validate_pipeline(X_static, X_temporal, y, RealTimeSeriesClassifier(), n_splits=10)
-    # logger.info("Baseline AUC=%.4f vs Stacked AUC=%.4f", baseline_results['aggregate']['auc_roc']['mean'], stacked_results['aggregate']['auc_roc']['mean'])
+    if args.compare:
+        models: Dict[str, BaseTimeSeriesClassifier] = {
+            "Null": NullTimeSeriesClassifier(),
+            "CIF": CanonicalIntervalForestClassifier(n_estimators=200, random_state=42),
+            "ROCKET": RocketTimeSeriesClassifier(num_kernels=10_000, random_state=42),
+            "LSTM": LSTMTimeSeriesClassifier(hidden_size=32, epochs=30, random_state=42),
+        }
+        all_results: Dict[str, Dict] = {}
+        for name, model in models.items():
+            logger.info("Running pipeline with %s...", name)
+            all_results[name] = validate_pipeline(X_static, X_temporal, y, model, n_splits=10)
+        _print_comparison_table(all_results)
+    else:
+        tsc_model = CanonicalIntervalForestClassifier(n_estimators=200, random_state=42)
+        logger.info("Starting stratified 10-fold validation with the stacked pipeline.")
+        results = validate_pipeline(X_static, X_temporal, y, tsc_model, n_splits=10)
+        logger.info("Aggregate validation results:")
+        for metric, stats in results["aggregate"].items():
+            logger.info("  %s: mean=%.4f, std=%.4f", metric, stats["mean"], stats["std"])
 
 
 if __name__ == "__main__":
