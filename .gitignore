@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Pytest
+.pytest_cache/
+
+# DuckDB extensions cache
+*.duckdb
+*.duckdb.wal
+
+# OS
+.DS_Store

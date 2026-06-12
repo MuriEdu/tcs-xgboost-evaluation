@@ -4,8 +4,14 @@ import math
 from typing import List, Optional, Tuple
 
 import numpy as np
-import pycatch22
 import polars as pl
+
+try:
+    import pycatch22
+except ImportError as _pycatch22_err:
+    raise ImportError(
+        "pycatch22 não está instalado. Execute: pip install pycatch22"
+    ) from _pycatch22_err
 from sklearn.exceptions import NotFittedError
 from sklearn.tree import DecisionTreeClassifier
 
@@ -79,6 +85,8 @@ class _CIFTree:
         return self
 
     def transform(self, X_np: np.ndarray) -> np.ndarray:
+        if self._tree is None:
+            raise NotFittedError("_CIFTree não foi treinada. Chame fit() primeiro.")
         feature_matrix = self._build_feature_matrix(X_np)
         return self._tree.predict_proba(feature_matrix)
 
@@ -101,6 +109,10 @@ class CanonicalIntervalForestClassifier(BaseTimeSeriesClassifier):
     def fit(self, X: pl.DataFrame, y: Optional[pl.Series] = None) -> "CanonicalIntervalForestClassifier":
         if y is None:
             raise ValueError("y é obrigatório para o treinamento do CIF.")
+        if self.n_estimators < 1:
+            raise ValueError(f"n_estimators deve ser >= 1, recebido {self.n_estimators}.")
+        if self.min_interval_length < 2:
+            raise ValueError(f"min_interval_length deve ser >= 2, recebido {self.min_interval_length}.")
         if X.width < self.min_interval_length:
             raise ValueError(
                 f"X tem {X.width} colunas, mas min_interval_length={self.min_interval_length}. "

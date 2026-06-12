@@ -40,12 +40,16 @@ def load_dataset(path: str, target_column: str = "inadimplent") -> pl.DataFrame:
     extension = os.path.splitext(path)[1].lower()
     if extension in {".xls", ".xlsx"}:
         try:
-            connection = duckdb.connect()
-            connection.install_extension("excel")
-            connection.load_extension("excel")
-            arrow_table = connection.execute(
-                f"SELECT * FROM read_xlsx('{path}')"
-            ).arrow()
+            with duckdb.connect() as connection:
+                try:
+                    connection.load_extension("excel")
+                except Exception:
+                    connection.install_extension("excel")
+                    connection.load_extension("excel")
+                read_fn = "read_xlsx" if extension == ".xlsx" else "read_xls"
+                arrow_table = connection.execute(
+                    f"SELECT * FROM {read_fn}(?)", [path]
+                ).arrow()
             df = pl.from_arrow(arrow_table)
         except Exception as exc:
             raise RuntimeError(
@@ -82,6 +86,12 @@ def normalize_target(series: pl.Series) -> pl.Series:
         "negative": 0,
     }
     if series.dtype in {pl.Float32, pl.Float64}:
+        non_binary = series.filter(~series.is_in([0.0, 1.0]) & series.is_not_null())
+        if non_binary.len() > 0:
+            raise ValueError(
+                f"Target column contains float values that are not 0.0 or 1.0 "
+                f"(e.g. {non_binary[0]}). Cannot safely convert to binary."
+            )
         try:
             target = series.cast(pl.Int64)
         except Exception as exc:
