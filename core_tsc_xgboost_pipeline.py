@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedKFold
 from xgboost import XGBClassifier
 
 from tsc_models import BaseTimeSeriesClassifier, NullTimeSeriesClassifier
-from tsc_models import CanonicalIntervalForestClassifier, LSTMTimeSeriesClassifier, RocketTimeSeriesClassifier
+from tsc_models import CanonicalIntervalForestClassifier, LSTMTimeSeriesClassifier, RocketTimeSeriesClassifier, ShapeletTimeSeriesClassifier
 
 
 logger = logging.getLogger(__name__)
@@ -236,16 +236,43 @@ def validate_pipeline(
     y_np = y.to_numpy().astype(int)
     sample_index = np.arange(len(y_np), dtype=int)
 
+    # Fit-once optimization: if the TSC transform is unsupervised and
+    # data-deterministic, the same row maps to the same meta-features in every
+    # fold. Compute them ONCE on all rows and slice per fold instead of
+    # recomputing the transform ~n_splits times. No leakage — the transform
+    # ignores labels and the train/test partition.
+    global_meta: Optional[pl.DataFrame] = None
+    if getattr(tsc_model, "supports_global_transform", False):
+        global_meta = tsc_model.fit_transform(X_temporal, y)
+        logger.info("Precomputed meta-features once for all rows (global transform).")
+
+    # Indexed-fit optimization (e.g. CIF): the per-(row, interval) features are
+    # fold-independent, only the trees are supervised. Build the feature cache
+    # ONCE over all rows, then retrain trees per fold by row index — turns
+    # ~n_splits Catch22 passes into a single one.
+    indexed_fit = global_meta is None and getattr(tsc_model, "supports_indexed_fit", False)
+    if indexed_fit:
+        tsc_model.prepare_cache(X_temporal)
+        logger.info("Built fold-independent feature cache once for all rows (indexed fit).")
+
     for fold_index, (train_idx, test_idx) in enumerate(splitter.split(sample_index, y_np), start=1):
         X_static_train = X_static.gather(train_idx)
         X_static_test = X_static.gather(test_idx)
-        X_temporal_train = X_temporal.gather(train_idx)
-        X_temporal_test = X_temporal.gather(test_idx)
         y_train = y.gather(train_idx)
         y_test = y.gather(test_idx)
 
-        X_meta_train = build_meta_features(tsc_model, X_temporal_train, y_train)
-        X_meta_test = build_meta_features(tsc_model, X_temporal_test)
+        if global_meta is not None:
+            X_meta_train = global_meta.gather(train_idx)
+            X_meta_test = global_meta.gather(test_idx)
+        elif indexed_fit:
+            tsc_model.fit_indexed(train_idx, y_train)
+            X_meta_train = tsc_model.transform_indexed(train_idx)
+            X_meta_test = tsc_model.transform_indexed(test_idx)
+        else:
+            X_temporal_train = X_temporal.gather(train_idx)
+            X_temporal_test = X_temporal.gather(test_idx)
+            X_meta_train = build_meta_features(tsc_model, X_temporal_train, y_train)
+            X_meta_test = build_meta_features(tsc_model, X_temporal_test)
 
         X_train = pl.concat([X_static_train, X_meta_train], how="horizontal")
         X_test = pl.concat([X_static_test, X_meta_test], how="horizontal")
@@ -321,10 +348,10 @@ def main() -> None:
     if args.compare:
         models: Dict[str, BaseTimeSeriesClassifier] = {
             "Null": NullTimeSeriesClassifier(),
-            "CIF": CanonicalIntervalForestClassifier(n_estimators=200, random_state=42),
-            "ROCKET": RocketTimeSeriesClassifier(num_kernels=10_000, random_state=42),
-            "Shapelets": ShapeletTimeSeriesClassifier(num_shapelets=100, random_state=42),
+            "CIF": CanonicalIntervalForestClassifier(n_estimators=20, random_state=42),
+            "ROCKET": RocketTimeSeriesClassifier(num_kernels=2_000, random_state=42),
             "LSTM": LSTMTimeSeriesClassifier(hidden_size=32, epochs=30, random_state=42),
+            "Shapelets": ShapeletTimeSeriesClassifier(num_shapelets=100, random_state=42),
         }
         all_results: Dict[str, Dict] = {}
         for name, model in models.items():
