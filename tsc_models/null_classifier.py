@@ -12,6 +12,8 @@ from .base import BaseTimeSeriesClassifier
 class NullTimeSeriesClassifier(BaseTimeSeriesClassifier):
     """Pass-through time-series classifier. Returns the input data unchanged."""
 
+    supports_global_transform = True
+
     def fit(self, X: pl.DataFrame, y: Optional[pl.Series] = None) -> "NullTimeSeriesClassifier":
         self.feature_names_ = X.columns
         return self
