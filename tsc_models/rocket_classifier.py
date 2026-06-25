@@ -22,7 +22,10 @@ class RocketTimeSeriesClassifier(BaseTimeSeriesClassifier):
     Produces 2 * num_kernels meta-features per sample, no training labels required.
     """
 
-    def __init__(self, num_kernels: int = 10_000, random_state: Optional[int] = 42) -> None:
+    # Kernels depend only on seq_len; transform is unsupervised and deterministic.
+    supports_global_transform = True
+
+    def __init__(self, num_kernels: int = 2_000, random_state: Optional[int] = 42) -> None:
         self.num_kernels = num_kernels
         self.random_state = random_state
         self._kernels: Optional[dict] = None
@@ -64,34 +67,47 @@ class RocketTimeSeriesClassifier(BaseTimeSeriesClassifier):
         }
 
     @staticmethod
-    def _apply_kernel(
-        series: np.ndarray,
+    def _apply_kernel_batch(
+        data: np.ndarray,
         weight: np.ndarray,
         bias: float,
         dilation: int,
         use_padding: int,
-    ) -> tuple[float, float]:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply one kernel to all samples at once.
+
+        ``data`` is (n_samples, seq_len). Returns (max_vals, ppv_vals), each
+        shaped (n_samples,). Vectorized over samples and output positions via a
+        dilated sliding window, replacing the former per-element Python loops.
+        """
+        n_samples = data.shape[0]
         kernel_len = len(weight)
         # Effective receptive field accounting for dilation
         effective_len = (kernel_len - 1) * dilation + 1
 
         if use_padding:
             pad_width = effective_len // 2
-            series = np.pad(series, pad_width, mode="constant", constant_values=0.0)
+            data = np.pad(
+                data, ((0, 0), (pad_width, pad_width)), mode="constant", constant_values=0.0
+            )
 
-        seq_len = len(series)
+        seq_len = data.shape[1]
         output_len = seq_len - effective_len + 1
         if output_len <= 0:
-            return float(bias), 0.0
+            return (
+                np.full(n_samples, bias, dtype=np.float32),
+                np.zeros(n_samples, dtype=np.float32),
+            )
 
-        output = np.empty(output_len, dtype=np.float32)
-        for i in range(output_len):
-            val = bias
-            for j in range(kernel_len):
-                val += weight[j] * series[i + j * dilation]
-            output[i] = val
+        # windows: (n_samples, output_len, effective_len); pick every dilation-th
+        # tap to recover the kernel_len positions the kernel actually touches.
+        windows = np.lib.stride_tricks.sliding_window_view(data, effective_len, axis=1)
+        taps = windows[:, :, ::dilation]  # (n_samples, output_len, kernel_len)
+        conv = taps @ weight + bias  # (n_samples, output_len)
 
-        return float(output.max()), float((output > 0).mean())
+        max_vals = conv.max(axis=1).astype(np.float32)
+        ppv_vals = (conv > 0).mean(axis=1).astype(np.float32)
+        return max_vals, ppv_vals
 
     def fit(self, X: pl.DataFrame, y: Optional[pl.Series] = None) -> "RocketTimeSeriesClassifier":
         self._kernels = self._generate_kernels(X.width)
@@ -108,18 +124,13 @@ class RocketTimeSeriesClassifier(BaseTimeSeriesClassifier):
 
         kernels = self._kernels
         for k in range(self.num_kernels):
-            max_vals = np.empty(n_samples, dtype=np.float32)
-            ppv_vals = np.empty(n_samples, dtype=np.float32)
-            for i in range(n_samples):
-                mv, pv = self._apply_kernel(
-                    data[i],
-                    kernels["weights"][k],
-                    kernels["biases"][k],
-                    kernels["dilations"][k],
-                    kernels["paddings"][k],
-                )
-                max_vals[i] = mv
-                ppv_vals[i] = pv
+            max_vals, ppv_vals = self._apply_kernel_batch(
+                data,
+                kernels["weights"][k],
+                kernels["biases"][k],
+                kernels["dilations"][k],
+                kernels["paddings"][k],
+            )
             output[:, k * 2] = max_vals
             output[:, k * 2 + 1] = ppv_vals
 
