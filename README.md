@@ -3,24 +3,29 @@
 Pipeline modular para previsão de inadimplência de clientes combinando Classificação de Séries Temporais (TSC) com XGBoost.
 
 Características principais:
-- Interface TSC genérica com quatro implementações intercambiáveis
+- Interface TSC genérica com cinco implementações intercambiáveis (Null, CIF, ROCKET, LSTM, Shapelets)
 - Engenharia de features com Polars (processamento colunar vetorizado)
 - Ingestão via DuckDB (`.xlsx`, `.csv`, `.parquet`) e pandas+xlrd (`.xls` legado)
 - Validação cruzada estratificada preservando distribuição de classes
 - Métricas voltadas a dados desbalanceados: AUC-ROC, F1, G-Mean, Matriz de Confusão
+- Otimizações de performance: transforms vetorizados, cache de features entre folds, paralelismo (joblib) e treino do LSTM em GPU — ver [Performance](#performance-e-otimizações)
+
+Resultados do comparativo mais recente em [`RESULTS.md`](RESULTS.md).
 
 ## Estrutura do Repositório
 
 ```
 tcs-xgboost-evaluation/
 ├── core_tsc_xgboost_pipeline.py   # Orquestração principal do pipeline
-├── dataset.xls                     # Dataset UCI Credit Card Default (30k amostras)
+├── dataset_aumentado.xlsx          # Dataset usado por padrão (160k amostras)
+├── RESULTS.md                      # Resultados e análise do comparativo
 └── tsc_models/
     ├── base.py                     # Interface BaseTimeSeriesClassifier
     ├── null_classifier.py          # Baseline pass-through
     ├── canonical_interval_forest.py
     ├── rocket_classifier.py
     ├── lstm_classifier.py
+    ├── shapelet_classifier.py
     ├── test_canonical_interval_forest.py
     ├── test_lstm_classifier.py
     └── test_rocket_classifier.py
@@ -68,8 +73,9 @@ As meta-features são concatenadas com as features estáticas para formar a entr
 |---|---|---|
 | **Null** | Retorna as features temporais brutas sem transformação | `n_features` colunas |
 | **CIF** | Treina 200 árvores de decisão sobre intervalos aleatórios da série; extrai média, desvio, inclinação e 22 features Catch22 por intervalo | `n_estimators × n_classes` colunas |
-| **ROCKET** | Aplica 10.000 kernels convolucionais 1D aleatórios; extrai MAX e PPV (proporção de valores positivos) por kernel | `20.000` colunas |
+| **ROCKET** | Aplica 2.000 kernels convolucionais 1D aleatórios; extrai MAX e PPV (proporção de valores positivos) por kernel | `4.000` colunas |
 | **LSTM** | Treina autoencoder LSTM para reconstruir a sequência temporal; o estado oculto final é a meta-feature | `hidden_size` colunas |
+| **Shapelets** | Sorteia subsequências aleatórias da série (shapelets); extrai a distância mínima z-normalizada de cada amostra a cada shapelet | `num_shapelets` colunas |
 
 **CIF — Canonical Interval Forest**
 Sorteia intervalos aleatórios da série temporal e extrai 25 features por intervalo (média, desvio padrão, inclinação + 22 features não-lineares via biblioteca `pycatch22`). Cada árvore é treinada com bootstrap sobre um subconjunto de intervalos, formando um ensemble.
@@ -78,7 +84,10 @@ Sorteia intervalos aleatórios da série temporal e extrai 25 features por inter
 Gera kernels com pesos, comprimentos, dilatações e paddings aleatórios. Aplica cada kernel como convolução 1D sobre a série e extrai dois valores: o máximo da saída (MAX) e a proporção de valores positivos (PPV). Os kernels não são treinados — a aleatoriedade cobre o espaço de padrões e o XGBoost seleciona os relevantes.
 
 **LSTM**
-Trata cada coluna temporal como um passo de tempo com dimensão de entrada 1. Treina um autoencoder (encoder LSTM + decoder linear) para reconstruir a série de entrada via MSE. O estado oculto do encoder no último passo de tempo é usado como representação compacta da série.
+Trata cada coluna temporal como um passo de tempo com dimensão de entrada 1. Treina um autoencoder (encoder LSTM + decoder linear) para reconstruir a série de entrada via MSE. O estado oculto do encoder no último passo de tempo é usado como representação compacta da série. Treina automaticamente em GPU quando há CUDA disponível.
+
+**Shapelets — Random Shapelet Transform**
+Sorteia subsequências aleatórias da série temporal (shapelets), cada uma z-normalizada. Para cada amostra, calcula a distância euclidiana mínima z-normalizada (via janela deslizante) entre a série e cada shapelet. As distâncias são as meta-features — o XGBoost aprende quais shapelets são discriminativos.
 
 ### 4. Classificação — `train_xgboost_classifier`
 
@@ -101,26 +110,41 @@ Retorna métricas por fold e agregadas (média e desvio padrão).
 ## Modelos TSC — Comparativo
 
 ```
-         ┌─────────────────────────────────────────┐
-         │         Features Temporais               │
-         │   [hist_1, hist_2, ..., hist_n]           │
-         └───────────────┬─────────────────────────┘
-                         │
-          ┌──────────────┼──────────────┐
-          │              │              │             │
-        Null            CIF          ROCKET         LSTM
-     (pass-through) (200 árvores) (10k kernels)  (autoencoder)
-          │              │              │             │
-     23 features    400 features   20.000 feat.   32 features
-          │              │              │             │
-          └──────────────┴──────────────┴─────────────┘
-                         │
-               concat(static + meta-features)
-                         │
-                    XGBClassifier
-                         │
-               AUC-ROC · F1 · G-Mean
+         ┌─────────────────────────────────────────────────────┐
+         │                 Features Temporais                   │
+         │           [hist_1, hist_2, ..., hist_n]              │
+         └────────────────────────┬────────────────────────────┘
+                                  │
+      ┌──────────────┬────────────┼────────────┬───────────────┐
+      │              │            │            │               │
+    Null            CIF        ROCKET        LSTM          Shapelets
+ (pass-through) (200 árvores) (2k kernels) (autoencoder) (100 shapelets)
+      │              │            │            │               │
+  18 features   400 features  4.000 feat.  32 features    100 feat.
+      │              │            │            │               │
+      └──────────────┴────────────┴────────────┴───────────────┘
+                                  │
+                     concat(static + meta-features)
+                                  │
+                             XGBClassifier
+                                  │
+                        AUC-ROC · F1 · G-Mean
 ```
+
+## Performance e Otimizações
+
+O pipeline foi otimizado para rodar em datasets grandes (160k+ amostras) sem recomputar trabalho redundante entre folds. As principais técnicas:
+
+| Otimização | Onde | Ganho |
+|---|---|---|
+| **Convolução vetorizada** | ROCKET (`_apply_kernel_batch`) | substitui laços Python por `sliding_window_view` + matmul (~100–1000×) |
+| **Distância vetorizada** | Shapelets (`_min_dist_batch`) | janela deslizante z-normalizada em lote (~285×) |
+| **`fit-once` global** | Null, ROCKET, Shapelets | transform não-supervisionado e determinístico roda **uma vez** sobre todas as linhas e é fatiado por fold (`supports_global_transform`) |
+| **Cache de features entre folds** | CIF (`prepare_cache` + `fit_indexed`) | Catch22 por intervalo é independente do fold → extraído uma vez, só as árvores retreinam por fold (`supports_indexed_fit`) |
+| **Paralelismo** | CIF (joblib) | extração Catch22 em chunks de linhas + treino de árvores em threads |
+| **GPU** | LSTM | treino em CUDA automático; batches movidos com `pin_memory`/`non_blocking` |
+
+Essas flags são lidas por `validate_pipeline`, que escolhe o caminho mais rápido por modelo. Para benchmarks concretos do run mais recente, ver [`RESULTS.md`](RESULTS.md).
 
 ## Instalação
 
@@ -128,6 +152,12 @@ Requer Python 3.10+.
 
 ```bash
 pip install polars duckdb pyarrow pandas xlrd numpy scikit-learn xgboost pycatch22 torch
+```
+
+Para acelerar o LSTM em GPU NVIDIA, instale o torch com suporte CUDA (ex. CUDA 12.4):
+
+```bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ## Uso
@@ -149,13 +179,16 @@ pytest tsc_models/
 
 ## Dataset
 
-O pipeline utiliza o [UCI Default of Credit Card Clients](https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients) (`dataset.xls`):
+Base original: [UCI Default of Credit Card Clients](https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients) (30.000 amostras, 23 features).
 
-- **30.000 amostras**, 23 features
+A execução padrão usa `dataset_aumentado.xlsx`, uma versão expandida:
+
+- **160.000 amostras**, 24 colunas (5 estáticas + 18 temporais)
 - Features temporais: histórico de pagamentos (PAY_0–PAY_6), valores de fatura (BILL_AMT1–6) e pagamentos realizados (PAY_AMT1–6)
 - Features estáticas: limite de crédito, sexo, escolaridade, estado civil, idade
-- **Target `Y`**: 1 = inadimplente no mês seguinte, 0 = adimplente
-- Desbalanceamento: ~22% positivos
+- **Target `default payment next month`**: 1 = inadimplente no mês seguinte, 0 = adimplente
+
+> **Nota:** por ser um dataset aumentado, métricas muito altas podem refletir correlação entre amostras sintéticas em folds diferentes. Ver ressalvas em [`RESULTS.md`](RESULTS.md).
 
 ## Métricas de Avaliação
 
