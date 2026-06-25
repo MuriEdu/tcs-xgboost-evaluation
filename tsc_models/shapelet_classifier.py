@@ -22,6 +22,11 @@ class ShapeletTimeSeriesClassifier(BaseTimeSeriesClassifier):
     Produces num_shapelets meta-features per sample.
     """
 
+    # Distances are unsupervised and data-deterministic: the same row always maps
+    # to the same shapelet distances, so the pipeline may fit+transform once on all
+    # rows and slice per fold instead of recomputing it inside every CV fold.
+    supports_global_transform = True
+
     def __init__(
         self, 
         num_shapelets: int = 100, 
@@ -62,24 +67,28 @@ class ShapeletTimeSeriesClassifier(BaseTimeSeriesClassifier):
         return shapelets
 
     @staticmethod
-    def _calculate_dist(series: np.ndarray, shapelet: np.ndarray) -> float:
-        """Calculate the minimum squared distance between a series and a shapelet."""
-        s_len = len(series)
+    def _min_dist_batch(data: np.ndarray, shapelet: np.ndarray) -> np.ndarray:
+        """Min z-normalized squared distance from each row to a shapelet.
+
+        Vectorized over all samples and sliding-window positions at once,
+        replacing the former per-window / per-sample Python loops. ``data`` is
+        (n_samples, seq_len); returns (n_samples,).
+        """
         sh_len = len(shapelet)
-        
-        # Sliding window distance
-        min_dist = float('inf')
-        for i in range(s_len - sh_len + 1):
-            window = series[i : i + sh_len]
-            # Z-normalize window
-            std = window.std()
-            if std > 0:
-                window = (window - window.mean()) / std
-            
-            dist = np.sum((window - shapelet) ** 2) / sh_len
-            if dist < min_dist:
-                min_dist = dist
-        return float(min_dist)
+        # windows: (n_samples, n_windows, sh_len)
+        windows = np.lib.stride_tricks.sliding_window_view(data, sh_len, axis=1)
+
+        mean = windows.mean(axis=2, keepdims=True)
+        std = windows.std(axis=2, keepdims=True)
+        # Z-normalize each window; leave constant windows (std==0) untouched, matching
+        # the original scalar implementation.
+        nonzero = std > 0
+        safe_std = np.where(nonzero, std, 1.0)
+        norm = np.where(nonzero, (windows - mean) / safe_std, windows)
+
+        # mean squared diff over the shapelet length, then min over windows
+        dist = ((norm - shapelet) ** 2).mean(axis=2)  # (n_samples, n_windows)
+        return dist.min(axis=1)
 
     def fit(self, X: pl.DataFrame, y: Optional[pl.Series] = None) -> "ShapeletTimeSeriesClassifier":
         data = X.to_numpy().astype(np.float32)
@@ -95,9 +104,7 @@ class ShapeletTimeSeriesClassifier(BaseTimeSeriesClassifier):
         output = np.empty((n_samples, self.num_shapelets), dtype=np.float32)
 
         for s_idx in range(self.num_shapelets):
-            shapelet = self._shapelets[s_idx]
-            for i in range(n_samples):
-                output[i, s_idx] = self._calculate_dist(data[i], shapelet)
+            output[:, s_idx] = self._min_dist_batch(data, self._shapelets[s_idx])
 
         col_names = [f"shapelet_dist_{i}" for i in range(self.num_shapelets)]
         return pl.DataFrame(output, schema=col_names)
